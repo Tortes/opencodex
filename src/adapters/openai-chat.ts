@@ -12,6 +12,10 @@ import { peekReasoningForCall } from "../responses/reasoning-replay-cache";
 import { buildNonOpenAIToolCatalogNudgeForTools, shouldInjectNonOpenAIToolCatalogNudge } from "./tool-catalog-nudge";
 import { openRouterProviderPayload, resolveOpenRouterRouting } from "../providers/openrouter-routing";
 import {
+  applyQwenVllmRequestCompat,
+  normalizeQwenVllmToolArguments,
+} from "./qwen-vllm-compat";
+import {
   isTranslatorBudgetExceededError,
   retainTranslatedEventBatch,
   TRANSLATOR_MAX_SSE_EVENT_BYTES,
@@ -164,6 +168,25 @@ function invalidChoicesEvent(usage?: OcxUsage): Extract<AdapterEvent, { type: "e
   return {
     type: "error",
     message: "upstream response contained invalid choices",
+    ...(usage !== undefined ? { usage } : {}),
+  };
+}
+
+function invalidQwenVllmToolArgumentsEvent(
+  callId: string,
+  name: string,
+  usage?: OcxUsage,
+): Extract<AdapterEvent, { type: "error" }> {
+  debugProviderDiagnostic("openai-chat", "qwen-vllm-invalid-tool-arguments", {
+    callId: callId || null,
+    toolName: name || null,
+  });
+  return {
+    type: "error",
+    status: 502,
+    errorType: "upstream_error",
+    code: "invalid_tool_arguments",
+    message: `upstream returned invalid JSON-object arguments for tool "${name || "unknown"}"`,
     ...(usage !== undefined ? { usage } : {}),
   };
 }
@@ -832,6 +855,15 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         body.stream_options = { include_usage: true };
       }
 
+      const qwenVllmCompat = applyQwenVllmRequestCompat(body, provider, tools !== undefined);
+      if (qwenVllmCompat.thinkingDisabled) {
+        reasoningLog = {
+          effectiveEffort: "none",
+          wireField: "chat_template_kwargs.enable_thinking",
+          wireValue: false,
+        };
+      }
+
       const url = `${provider.baseUrl}/chat/completions`;
       const headers: Record<string, string> = { "Content-Type": "application/json" };
       // Precedence preserved from pre-#128 behavior: apiKey Authorization first, then
@@ -895,15 +927,28 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         pendingToolCalls.length = 0;
         return calls;
       };
-      const flushToolCalls = function* (): Generator<AdapterEvent> {
-        // Do not treat flushed tool calls as user-facing output for the finish-less EOF
-        // fallback — incomplete tool args must stay on the truncation path.
+      const flushToolCalls = function* (): Generator<AdapterEvent, boolean> {
+        // Validate the entire batch before emitting any call. A provider terminal signal does not
+        // make a half-written JSON buffer safe to execute.
+        const prepared: Array<{ call: PendingToolCall; arguments: string }> = [];
         for (const call of closeToolCalls()) {
           if (!call.id) call.id = `call_${++toolCallSeq}`;
+          const normalized = normalizeQwenVllmToolArguments(call.args, provider);
+          if (!normalized.ok) {
+            yield invalidQwenVllmToolArgumentsEvent(call.id, call.name, pendingUsage);
+            return false;
+          }
+          prepared.push({ call, arguments: normalized.arguments });
+        }
+
+        // Do not treat flushed tool calls as user-facing output for the finish-less EOF
+        // fallback — incomplete tool args must stay on the truncation path.
+        for (const { call, arguments: args } of prepared) {
           yield { type: "tool_call_start", id: call.id, name: call.name };
-          if (call.args.length > 0) yield { type: "tool_call_delta", arguments: call.args };
+          if (args.length > 0) yield { type: "tool_call_delta", arguments: args };
           yield { type: "tool_call_end" };
         }
+        return true;
       };
       const terminateWithError = function* (
         event: Extract<AdapterEvent, { type: "error" }>,
@@ -930,7 +975,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         if (!line.startsWith("data: ")) return "continue";
         const payload = line.slice(6).trim();
         if (payload === "[DONE]") {
-          yield* flushToolCalls();
+          if (!(yield* flushToolCalls())) return "terminate";
           const stopReason = stopReasonFor(finishReason);
           yield { type: "done", usage: pendingUsage, ...(stopReason ? { stopReason } : {}) };
           return "terminate";
@@ -1038,7 +1083,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         // Any non-empty finish_reason ends the generation: flush assembled tool calls as
         // atomic sequences (covers "tool_calls" AND providers that close tool turns with "stop").
         if (typeof choice.finish_reason === "string" && choice.finish_reason) {
-          yield* flushToolCalls();
+          if (!(yield* flushToolCalls())) return "terminate";
         }
         return "continue";
       };
@@ -1114,7 +1159,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
           yield { type: "error", message: "upstream stream ended without a terminal signal ([DONE] or finish_reason) — possible truncation" };
           return;
         }
-        yield* flushToolCalls();
+        if (!(yield* flushToolCalls())) return;
         // Graceful close that omitted [DONE] but delivered finish_reason and/or answer text.
         const stopReason = stopReasonFor(finishReason);
         yield { type: "done", usage: pendingUsage, ...(stopReason ? { stopReason } : {}) };
@@ -1184,9 +1229,17 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
       }
       const toolCalls = msg.tool_calls as { id: string; function: { name: string; arguments: string } }[] | undefined;
       if (toolCalls) {
+        const prepared: Array<{ id: string; name: string; arguments: string }> = [];
         for (const tc of toolCalls) {
-          events.push({ type: "tool_call_start", id: tc.id, name: tc.function.name });
-          events.push({ type: "tool_call_delta", arguments: tc.function.arguments });
+          const normalized = normalizeQwenVllmToolArguments(tc.function.arguments, provider);
+          if (!normalized.ok) {
+            return [invalidQwenVllmToolArgumentsEvent(tc.id, tc.function.name, usage)];
+          }
+          prepared.push({ id: tc.id, name: tc.function.name, arguments: normalized.arguments });
+        }
+        for (const tc of prepared) {
+          events.push({ type: "tool_call_start", id: tc.id, name: tc.name });
+          if (tc.arguments.length > 0) events.push({ type: "tool_call_delta", arguments: tc.arguments });
           events.push({ type: "tool_call_end" });
         }
       }
