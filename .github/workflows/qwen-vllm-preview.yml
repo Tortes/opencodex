@@ -1,0 +1,75 @@
+name: Qwen vLLM preview package
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - agent/qwen-vllm-compat
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply Qwen-vLLM source patch
+        run: node scripts/apply-qwen-vllm-compat.mjs .
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test Qwen-vLLM compatibility
+        run: bun test tests/qwen-vllm-compat.test.ts
+
+      - name: Run OpenAI Chat adapter regressions
+        run: |
+          bun test \
+            tests/openai-chat-dangling-toolcalls.test.ts \
+            tests/qwen38-preserve-reasoning.test.ts \
+            tests/nvidia-nim-hardening.test.ts
+
+      - name: Build package payload
+        run: bun run prepare:package
+
+      - name: Pack preview npm tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_FILE="$(npm pack --ignore-scripts --json | node -e '
+            let input="";
+            process.stdin.on("data", c => input += c);
+            process.stdin.on("end", () => console.log(JSON.parse(input)[0].filename));
+          ')"
+          mkdir -p dist/preview
+          mv "$PACKAGE_FILE" "dist/preview/opencodex-qwen-vllm-preview.tgz"
+          sha256sum "dist/preview/opencodex-qwen-vllm-preview.tgz" \
+            > "dist/preview/opencodex-qwen-vllm-preview.tgz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opencodex-qwen-vllm-preview
+          path: dist/preview/*
+          if-no-files-found: error
+
+      - name: Publish GitHub prerelease
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: qwen-vllm-preview-${{ github.run_number }}
+          name: Qwen vLLM preview #${{ github.run_number }}
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          generate_release_notes: false
+          body: |
+            Preview build of opencodex v2.10.2 with the provider-local Qwen-vLLM compatibility profile.
+            Install the attached tarball with: npm install -g ./opencodex-qwen-vllm-preview.tgz
+          files: dist/preview/*
