@@ -19,7 +19,9 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Apply Qwen-vLLM source patch
-        run: node scripts/apply-qwen-vllm-compat.mjs .
+        run: |
+          node scripts/apply-qwen-vllm-compat.mjs .
+          node scripts/fix-qwen-vllm-reasoning-log.mjs src/adapters/openai-chat.ts
 
       - uses: oven-sh/setup-bun@v2
         with:
