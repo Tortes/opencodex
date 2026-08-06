@@ -855,14 +855,7 @@ export function createOpenAIChatAdapter(provider: OcxProviderConfig): ProviderAd
         body.stream_options = { include_usage: true };
       }
 
-      const qwenVllmCompat = applyQwenVllmRequestCompat(body, provider, tools !== undefined);
-      if (qwenVllmCompat.thinkingDisabled) {
-        reasoningLog = {
-          effectiveEffort: "none",
-          wireField: "chat_template_kwargs.enable_thinking",
-          wireValue: false,
-        };
-      }
+      applyQwenVllmRequestCompat(body, provider, tools !== undefined);
 
       const url = `${provider.baseUrl}/chat/completions`;
       const headers: Record<string, string> = { "Content-Type": "application/json" };
