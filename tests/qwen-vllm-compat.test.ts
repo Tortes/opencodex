@@ -11,7 +11,7 @@ function provider(overrides: Partial<OcxProviderConfig> = {}): OcxProviderConfig
     adapter: "openai-chat",
     baseUrl: "http://127.0.0.1:8000/v1",
     authMode: "local",
-    qwenVllmCompat: {},
+    qwenVllmCompat: { disableThinkingOnToolTurns: false },
     ...overrides,
   };
 }
@@ -43,7 +43,7 @@ function parsed(withTools = true): OcxParsedRequest {
 }
 
 describe("Qwen-vLLM request compatibility", () => {
-  test("tool turns strip stop, disable thinking, and force one tool call", () => {
+  test("agent-thinking tool turns preserve thinking and force one tool call", () => {
     const adapter = createOpenAIChatAdapter(provider());
     const body = JSON.parse(adapter.buildRequest(parsed(true)).body) as Record<string, unknown>;
 
@@ -52,21 +52,70 @@ describe("Qwen-vLLM request compatibility", () => {
     expect(body.reasoning).toBeUndefined();
     expect(body.thinking).toBeUndefined();
     expect(body.thinking_budget).toBeUndefined();
-    expect(body.chat_template_kwargs).toEqual({ enable_thinking: false });
+    expect(body.chat_template_kwargs).toEqual({
+      enable_thinking: true,
+      preserve_thinking: true,
+    });
     expect(body.parallel_tool_calls).toBe(false);
   });
 
-  test("plain text turns are unchanged", () => {
+  test("agent-thinking applies Qwen chat-template flags on plain text turns too", () => {
     const adapter = createOpenAIChatAdapter(provider());
     const body = JSON.parse(adapter.buildRequest(parsed(false)).body) as Record<string, unknown>;
 
     expect(body.stop).toEqual(["<|im_end|>"]);
-    expect(body.reasoning_effort).toBe("high");
-    expect(body.chat_template_kwargs).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+    expect(body.chat_template_kwargs).toEqual({
+      enable_thinking: true,
+      preserve_thinking: true,
+    });
     expect(body.parallel_tool_calls).toBeUndefined();
   });
 
-  test("every request adjustment can be disabled independently", () => {
+  test("legacy empty profile still disables thinking only on tool turns", () => {
+    const adapter = createOpenAIChatAdapter(provider({ qwenVllmCompat: {} }));
+    const toolBody = JSON.parse(adapter.buildRequest(parsed(true)).body) as Record<string, unknown>;
+    const textBody = JSON.parse(adapter.buildRequest(parsed(false)).body) as Record<string, unknown>;
+
+    expect(toolBody.chat_template_kwargs).toEqual({ enable_thinking: false });
+    expect(toolBody.reasoning_effort).toBeUndefined();
+    expect(textBody.chat_template_kwargs).toBeUndefined();
+    expect(textBody.reasoning_effort).toBe("high");
+  });
+
+  test("agent-thinking auto-registers the routed model for later reasoning replay", () => {
+    const p = provider();
+    const adapter = createOpenAIChatAdapter(p);
+    adapter.buildRequest(parsed(true));
+
+    expect(p.preserveReasoningContentModels).toContain("Qwen3.6-27B");
+
+    const next = parsed(true);
+    next.context.messages = [
+      {
+        role: "assistant",
+        timestamp: 1,
+        content: [
+          { type: "thinking", thinking: "inspect the repository first" },
+          { type: "toolCall", id: "call_1", name: "shell", arguments: { command: "pwd" } },
+        ],
+      },
+      {
+        role: "toolResult",
+        toolCallId: "call_1",
+        toolName: "shell",
+        content: "/tmp/project",
+        isError: false,
+        timestamp: 2,
+      },
+    ];
+
+    const body = JSON.parse(adapter.buildRequest(next).body) as { messages: Array<Record<string, unknown>> };
+    const assistant = body.messages.find(message => message.role === "assistant");
+    expect(assistant?.reasoning_content).toBe("inspect the repository first");
+  });
+
+  test("every legacy request adjustment can still be disabled independently", () => {
     const p = provider({
       qwenVllmCompat: {
         stripStopOnToolTurns: false,
@@ -75,6 +124,7 @@ describe("Qwen-vLLM request compatibility", () => {
       },
     });
     const body: Record<string, unknown> = {
+      model: "Qwen3.6-27B",
       stop: ["END"],
       reasoning_effort: "medium",
       parallel_tool_calls: true,
@@ -82,7 +132,8 @@ describe("Qwen-vLLM request compatibility", () => {
 
     expect(applyQwenVllmRequestCompat(body, p, true)).toEqual({ enabled: true, thinkingDisabled: false });
     expect(body.stop).toEqual(["END"]);
-    expect(body.reasoning_effort).toBe("medium");
+    expect(body.reasoning_effort).toBeUndefined();
+    expect(body.chat_template_kwargs).toEqual({ enable_thinking: true, preserve_thinking: true });
     expect(body.parallel_tool_calls).toBe(true);
   });
 });

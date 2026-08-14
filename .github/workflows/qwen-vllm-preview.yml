@@ -72,5 +72,7 @@ jobs:
           generate_release_notes: false
           body: |
             Preview build of opencodex v2.10.2 with the provider-local Qwen-vLLM compatibility profile.
+            Recommended Qwen3.6 agent mode enables chat-template thinking, replays reasoning_content,
+            and sends preserve_thinking=true across multi-turn tool use while retaining strict tool-call hardening.
             Install the attached tarball with: npm install -g ./opencodex-qwen-vllm-preview.tgz
           files: dist/preview/*
