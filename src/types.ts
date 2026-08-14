@@ -1038,6 +1038,19 @@ export interface RateLimitRetryPolicy {
   respectRetryAfter?: boolean;
 }
 
+export interface QwenVllmCompatConfig {
+  /** Master switch. The presence of the object enables the profile unless explicitly false. */
+  enabled?: boolean;
+  /** Remove stop/stop_token_ids on requests carrying tools. Default true. */
+  stripStopOnToolTurns?: boolean;
+  /** Set chat_template_kwargs.enable_thinking=false and remove conflicting reasoning controls. Default true. */
+  disableThinkingOnToolTurns?: boolean;
+  /** Force parallel_tool_calls=false on tool turns. Default true. */
+  forceSingleToolCall?: boolean;
+  /** Reject completed function calls whose arguments are not JSON objects. Default true. */
+  validateToolArguments?: boolean;
+}
+
 /**
  * One configured provider entry. `authMode` (default `"key"`) decides whether same-target 429
  * retries are allowed; OAuth/forward credentials and local runtimes are never replayed.
@@ -1264,6 +1277,11 @@ export interface OcxProviderConfig {
    * before any response bytes are relayed, so the replay is lossless.
    */
   retryOn429?: RateLimitRetryPolicy;
+  /**
+   * Explicit compatibility profile for Qwen chat templates served by vLLM. Config-file only.
+   * Absent means no behavior change; an empty object enables the safe defaults.
+   */
+  qwenVllmCompat?: QwenVllmCompatConfig;
   /**
    * Model ids whose OpenAI-compatible chat endpoint accepts `reasoning_split: true` and returns
    * thinking separately in `reasoning_content` / `reasoning_details` instead of visible content.
